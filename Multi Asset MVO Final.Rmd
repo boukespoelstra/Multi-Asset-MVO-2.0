@@ -1,0 +1,722 @@
+---
+title: "Experiment"
+author: "Bouke Spoelstra"
+date: "2024-10-29"
+output:
+  html_document:
+    number_sections: true
+---
+
+# Step 1: Setup
+Installing Packages, Importing Data, Creating Dataframes
+```{r}
+
+## SETUP ##
+
+# Step 1a: Install & Load Packages
+if(!require(quantmod)) install.packages("quantmod")
+if(!require(corpcor)) install.packages("corpcor")
+if(!require(plotly)) install.packages("plotly")
+if(!require(forecast)) install.packages("forecast")
+if(!require(smooth)) install.packages("smooth")
+if(!require(quadprog)) install.packages("quadprog")
+if (!require(ggplot2)) install.packages("ggplot2")
+if(!require(tidyr)) install.packages("tidyr")
+if(!require(gridExtra)) install.packages("gridExtra")
+library(quantmod)
+library(corpcor)
+library(plotly)
+library(forecast)
+library(smooth)
+library(quadprog)
+library(ggplot2)
+library(tidyr)
+library(gridExtra)
+
+# Step 1b: Prompt User for Stock Symbols
+cat("Please enter symbols (tickers) separated by commas (e.g., 'AMD, GOOGL, MSFT, TSLA, NVDA'):\n")              # Ask the user what stocks they would like to choose
+symbols <- strsplit(readline(), ",")[[1]]                                                                        # Reads chosen assets
+symbols <- trimws(symbols)                                                                                       # Remove any extra whitespace
+cat("Your chosen assets are:",print(symbols))                                                                    # Print chosen assets
+
+# Step 1c: Define start and end dates for data download
+start_date <- "2019-01-01"                                                                                       # Make sure this is in "YYYY-MM-DD" format
+end_date <- "2024-01-01"
+
+# Step 1d: Download Data for User-specified Assets
+assets <- getSymbols(symbols, src = "yahoo", from = start_date, to = end_date, periodicity = "monthly", auto.assign = TRUE)    # Use Quantmod's getSymbols function, periodicity for monthly data
+
+# Step 1e: Create Arrays of Prices and Returns for Each Asset
+prices <- lapply(symbols, function(sym) get(sym)[, paste0(sym, ".Adjusted")])                   # Function to add prices to df based on symbol names
+returns <- lapply(prices, function(pr) na.omit(diff(log(pr))))                                  # Function to create returns in df using diff(log)
+
+# Step 1f: Download Benchmark (10-Year Bond)
+getSymbols("^TNX", src = "yahoo", from = start_date, to = end_date, periodicity = "monthly", auto.assign = TRUE)
+tnx <- TNX[, "TNX.Adjusted"] / 1200. # Bond return adjustment for monthly data
+rtnx <- tnx[-1] # Lag adjustment for monthly data
+
+# Step 1g: Calculate Excess Returns
+excess_returns <- lapply(returns, function(ret) ret - rtnx) # Excess returns = returns to asset - bond returns
+
+# Step 1h: Create data frames (df) Combining Prices, Returns, and Excess Returns
+pTab <- do.call(data.frame, prices)                                               # Create df of prices
+rTab <- do.call(data.frame, returns)                                              # Create df of returns
+erTab <- do.call(data.frame, excess_returns)                                      # Create df of excess returns
+colnames(pTab) <- paste(symbols, "Price")                                         # Modify column names for pTab to append "Price"
+colnames(rTab) <- paste(symbols, "Return")                                        # Modify column names for rTab to append "Return"
+colnames(erTab) <- paste(symbols, "Excess Returns")                               # Modify column names for erTab to append "Excess Returns"
+```
+
+# Step 2: Create Matrices
+Make covariance 
+```{r}
+
+## CREATING MATRICES ##
+
+# Step 2a: Create Covariance Matrix for Assets
+VCV <- cov(rTab)
+colnames(VCV) <- symbols
+rownames(VCV) <- symbols
+
+# Step 2b: Create Matrices 
+pMat <- as.matrix(pTab)        # Set objects as matrices for algebraic operations later
+rMat <- as.matrix(rTab)
+erMat <- as.matrix(erTab)
+VCV <- as.matrix(VCV)
+
+# Step 2c: Calculate Average & Excess Returns
+rm = matrix(colMeans(rMat, na.rm = TRUE))         #creates an average return matrix, omitting missing values
+erm = matrix(colMeans(erMat, na.rm = TRUE))       #creates an average excess return matrix, omitting missing values
+rtnx_mean = mean((rtnx))                          #calculates the average bond yield excluding Jan (risk free rate)
+
+# Step 2d: Create Return & Excess Return Matrix (for easy display)
+rermat <- matrix(c(rm, erm), ncol=2)
+dimnames(rermat) = list(symbols, c("Return ", "Excess Return"))
+```
+
+# Step 3: Calculating Weights
+Optimal portfolio with short sales, Optimal portfolio with no short sales, global minimum variance portfolio.
+```{r}
+
+## CALCULATING WEIGHTS ##
+
+# Optimum Portfolio - Short Sales Allowed (i.e., weights can be negative)
+
+# Step 4a: Solve for optimal weights with short sales
+ZOPT <- solve(VCV,erm)                                   #multiply inverse of VCV to excess returnm to find z; 
+WOPT <- ZOPT/sum(ZOPT)                                   #calculates weights
+dimnames(WOPT) <- list(symbols, "Weights")               #label the weight matrix
+
+# Optimum Portfolio - Short Sales Not Allowed (i.e., all weights >= 0)
+
+# Step 4b: Set new variables for organizational purposes
+Dmat <- VCV                                               # Covariance matrix
+dvec <- erm                                               # Expected excess returns
+
+# Step 4c: Add constraint matrix and bounds
+Amat <- cbind(1, diag(ncol(Dmat)))              # Matrix of constraints (sum of weights = 1 and each weight >= 0)
+bvec <- c(1, rep(0, ncol(Dmat)))                # Right-hand side (1 for sum, 0 for each weight bound)
+
+# Step 4d: Solve the optimization problem with no-short constraint
+result <- solve.QP(Dmat, dvec, Amat, bvec, meq = 1)
+WOPT_ns <- result$solution
+
+# Step 4e: Convert the weights to a matrix and set dimnames
+WOPT_ns <- matrix(result$solution, ncol = 1)
+dimnames(WOPT_ns) <- list(symbols, "Weights")
+
+# Step 4f: Round very small values to zero for readability
+WOPT_ns[abs(WOPT_ns) < 1e-6] <- 0 # Round extremely small values to zero
+
+# Global Minimum Variance portfolio
+
+# Step 4g: Calculate GMV Weights
+num_sym <- length(symbols)                                    # Number of assets
+ones_vector <- matrix(rep(1, num_sym), nrow = num_sym)        # Create a vector of ones with length equal to the number of assets
+ZGMV <- solve(VCV, ones_vector)                               # Inverse var-covar matrix * ones vector
+WGMV <- ZGMV / sum(ZGMV)                                      # Normalize weights
+```
+
+# Step 4: Calculate Portfolio Statistics
+Expected return, variance, standard deviation, sharpe ratio, treynor ratio, coefficient of variation (CV), and sortino ratio.
+```{r}
+
+## CALCULATE PORTFOLIO STATISTICS ##
+
+# Step 5a: Expected return, var, SD, Sharpe, Treynor, CV for all three portfolios
+ROPT <- t(WOPT) %*% rm                                                   # Calculate optimal portfolio's expected returns (short sales allowed)
+ROPT_ns <- t(WOPT_ns) %*% rm                                             # Calculate optimal portfolio's expected returns (short sales NOT allowed)
+RGMV <- t(WGMV) %*% rm                                                   # Calculate global minimum variance portfolio's expected returns
+VOPT <- t(WOPT) %*% VCV %*% WOPT                                         # Calculate optimal portfolio's variance (short sales allowed)
+VOPT_ns <- t(WOPT_ns) %*% VCV %*% WOPT_ns                                # Calculate optimal portfolio's variance (short sales NOT allowed)
+VGMV <- t(WGMV) %*% VCV %*% WGMV                                         # Calculate global minimum variance portfolio's variance
+SDOPT <- VOPT^0.5                                                        # Calculate optimal portfolio's standard deviation (short sales allowed)
+SDOPT_ns <- VOPT_ns^0.5                                                  # Calculate optimal portfolio's standard deviation (short sales not allowed)
+SDGMV <- VGMV^0.5                                                        # Calculate global minimum variance portfolio's standard deviation
+SROPT <- (ROPT - rtnx_mean) / (SDOPT)                                    # Calculate optimal portfolio's Sharpe ratio (short sales allowed)
+SROPT_ns <- (ROPT_ns - rtnx_mean) / (SDOPT_ns)                           # Calculate optimal portfolio's Sharpe ratio (short sales NOT allowed)
+SRGMV <- (RGMV - rtnx_mean) / (SDGMV)                                    # Calculate global minimum variance portfolio's Sharpe ratio
+TROPT <- (ROPT - rtnx_mean) / (t(WOPT) %*% VCV %*% WOPT)                 # Calculate optimal portfolio Treynor ratio (short sales allowed)
+TROPT_ns <- (ROPT_ns - rtnx_mean) / (t(WOPT_ns) %*% VCV %*% WOPT_ns)     # Calculate optimal portfolio Treynor ratio (short sales NOT allowed)
+TRGMV <- (RGMV - rtnx_mean) / (t(WGMV) %*% VCV %*% WGMV)                 # Calculate GMV portfolio Treynor ratio
+CVOPT <- SDOPT / ROPT                                                    # Coefficient of Variation (SSA)
+CVOPT_ns <- SDOPT_ns / ROPT_ns                                           # Coefficient of Variation (SSNA)
+CVGMV <- SDGMV / RGMV                                                    # Coefficient of Variation (GMV)
+
+# Calculate Sortino Ratio using semi-standard deviation #
+
+# Step 5b: Set return table as matrix
+rTab2 <- as.matrix(rTab)
+# Step 5c: Calculate Portfolio Returns
+pr_opt <- rTab2 %*% WOPT                                    # Optimal portfolio returns, expected returns weighted (short sales allowed)
+pr_opt_ns <- rTab2 %*% WOPT_ns                              # Optimal portfolio returns, expected returns weighted (short sales NOT allowed)
+pr_gmv <- rTab2 %*% WGMV                                    # GMV Portfolio returns, expected returns weighted
+# Step 5d: Calculate Downside Deviations
+pr_dev_opt <- pr_opt - mean(pr_opt)                         # short sales allowed (SSA)
+pr_dev_opt_ns <- pr_opt_ns - mean(pr_opt_ns)                # short sales NOT allowed (SSNA)
+pr_dev_gmv <- pr_gmv - mean(pr_gmv)                         # GMV
+pr_sdev <- replace(pr_dev_opt, pr_dev_opt > 0, 0)           # SSA
+pr_sdev_ns <- replace(pr_dev_opt_ns, pr_dev_opt_ns > 0, 0)  # SSNA
+pr_sdev_gmv <- replace(pr_dev_gmv, pr_dev_gmv > 0, 0)       # GMV
+pr_var <- var(pr_sdev)                                      # SSA
+pr_var_ns <- var(pr_sdev_ns)                                # SSNA
+pr_var_gmv <- var(pr_sdev_gmv)                              # GMV
+pr_ssd <- sqrt(pr_var)                                      # creates portfolio semi-standard deviation (SSA)
+pr_ssd_ns <- sqrt(pr_var_ns)                                # creates portfolio semi-standard deviation (SSNA)
+pr_ssd_gmv <- sqrt(pr_var_gmv)                              # creates portfolio semi-standard deviation (GMV)
+# Step 5e: Calculate Sortino Ratio
+sortino_opt <- (ROPT - rtnx_mean) / pr_ssd                  # Sortino Ratio (SSA)
+sortino_opt_ns <- (ROPT_ns - rtnx_mean) / pr_ssd_ns         # Sortino Ratio (SSNA)
+sortino_gmv <- (RGMV - rtnx_mean) / pr_ssd_gmv              # Sortino Ratio (GMV)
+
+# Creating Stats Tables #
+
+# Step 5c: Create Optimal Stats Table (SSA)
+PTBL_opt <- matrix(c(ROPT, VOPT, SDOPT, SROPT, TROPT, sortino_opt, CVOPT), nrow = 7)                         # Include CV
+PTBL.names <- c("Return", "Variance", "Std Dev", "Sharpe", "Treynor", "Sortino", "CV")                       # Update labels for PTBL matrix
+# Step 5d: Create Optimal Stats Table (SSNA)
+PTBL_ns <- matrix(c(ROPT_ns, VOPT_ns, SDOPT_ns, SROPT_ns, TROPT_ns, sortino_opt_ns, CVOPT_ns), nrow = 7)     # Include CV
+# Step 5e: Create Optimal Stats Table (SSNA)
+PTBL_gmv <- matrix(c(RGMV, VGMV, SDGMV, SRGMV, TRGMV, sortino_gmv, CVGMV), nrow = 7)                         # Include CV
+dimnames(PTBL_opt) <- list(PTBL.names, "Opt. Portfolio")                                                     # Label the optimal portfolio matrix values
+dimnames(PTBL_ns) <- list(PTBL.names, "Opt. Portfolio (No Short Sale)")                                      # Label the optimal (NSSA) portfolio matrix values
+dimnames(PTBL_gmv) <- list(PTBL.names, "GMV Portfolio")                                                      # Label the GMV portfolio matrix values
+```
+
+# Step 5: Benchmarking to S&P500
+Comparing portfolio statistics to market index.
+```{r}
+
+## BENCHMARKING TO SP500 ##
+
+# Step 6a: Download S&P 500 Data
+GSPC <- getSymbols("^GSPC", src = "yahoo", from = start_date, to = end_date, periodicity = "monthly", auto.assign = FALSE)
+gspc_adj <- GSPC[, "GSPC.Adjusted"]
+rgspc <- na.omit(diff(log(gspc_adj)))  # S&P 500 monthly returns
+
+# Step 6b: Calculate S&P 500 Statistics
+gspc_return <- mean(rgspc, na.rm = TRUE)                # GSPC Mean Return
+gspc_var <- var(rgspc, na.rm = TRUE)                    # GSPC Variance
+gspc_sd <- sqrt(gspc_var)                               # GSPC Standard deviation
+gspc_sharpe <- (gspc_return - rtnx_mean) / gspc_sd      # GSPC Sharpe Ratio
+gspc_cv <- gspc_sd / gspc_return                        # GSPC Coefficient of Variation
+sp_dev <- rgspc - gspc_return                           # gspc return deviation from mean
+sp_sdev <- replace(sp_dev, sp_dev > 0, 0)               # replace deviation with 0 if positive (only need DOWNSIDE deviations)
+sp_var <- var(sp_sdev)                                  # find variance of downside deviations
+gspc_SSD <- sqrt(sp_var)                                # creates gspc semi-standard deviation
+gspc_sortino <- (gspc_return - rtnx_mean) / gspc_SSD    # GSPC Sortino Ratio
+gspc_treynor <- (gspc_return - rtnx_mean) / 1           # GSPC Treynor Ratio, Assuming beta_gspc = 1 for S&P500 as a proxy for market
+
+# Step 6c: Add S&P 500 statistics to PTBL table
+SP500_Stats <- matrix(c(gspc_return, gspc_var, gspc_sd, gspc_sharpe, gspc_treynor, gspc_sortino, gspc_cv), 
+                      nrow = 7, ncol = 1)
+colnames(SP500_Stats) <- "S&P 500"
+rownames(SP500_Stats) <- c("Return", "Variance", "Std Dev", "Sharpe", "Treynor", "Sortino", "CV")
+
+# Step 6d: Combine portfolio stats with S&P 500 stats
+PTBL_opt_combined <- cbind(PTBL_opt, SP500_Stats)                    # Combine SP500 benchmark and portfolio statistics tables
+PTBL_ns_combined <- cbind(PTBL_ns, SP500_Stats)
+PTBL_gmv_combined <- cbind(PTBL_gmv, SP500_Stats)
+```
+
+# Step 6: CAL & Efficient Frontier
+Plotting capital allocation line, efficient frontier, and tangency portfolio.
+```{r}
+
+## EFFICIENT FRONTIER AND CAL ##
+
+# Step 7a: Number of assets (this can vary based on the input)
+num_assets <- length(symbols)
+
+# Step 7b: Generate all possible combinations of weights for `num_assets` with step increments `step_size`
+generate_weights <- function(num_assets, step_size = 0.1) {
+  # Weights are allowed to go from -0.2 to 1 by `step_size`.
+  seq_weights <- seq(-0.2, 1, step_size)
+  weight_combinations <- expand.grid(replicate(num_assets, seq_weights, simplify = FALSE))
+  
+  # Filter combinations to only those where weights sum to 1.
+  valid_combinations <- weight_combinations[rowSums(weight_combinations) == 1, ]
+  return(as.matrix(valid_combinations))
+}
+
+# Step 7c: Generate weight combinations for the efficient frontier
+fractions <- generate_weights(num_assets)
+
+# Step 7d: Initialize vectors to store portfolio returns and standard deviations
+num_combinations <- nrow(fractions)
+return_p <- numeric(num_combinations)
+sd_p <- numeric(num_combinations)
+
+# Step 7e: Calculate portfolio statistics for each combination
+for (j in seq_len(num_combinations)) {
+  weights <- fractions[j, ]
+  return_p[j] <- sum(weights * rm)  # Expected portfolio return
+  sd_p[j] <- sqrt(t(weights) %*% VCV %*% weights)  # Portfolio standard deviation
+}
+# Step 7f: Capital Allocation Line
+f <- seq(0, max(sd_p), length.out = 100)  # Adjust x-coordinates based on max portfolio SD
+CAL <- rtnx_mean + c(SROPT) * f  # Adjusted CAL equation using optimal Sharpe ratio
+
+# Step 7g: Plot Efficient Frontier
+plot(sd_p, return_p, col="green", xlab="Portfolio Standard Deviation", ylab="Portfolio Expected Return",
+     xlim=c(0, max(sd_p)), ylim=c(0, max(return_p)), pch=16)
+# Overlay the Global Minimum Variance (GMV) portfolio
+points(SDGMV, RGMV, col="red", pch=17)
+# Overlay the Optimal Tangency Portfolio
+points(SDOPT, ROPT, col="black", pch=16)
+lines(f, CAL, col="blue", lwd=2)# Add Capital Allocation Line
+legend("bottomright", legend=c("Efficient Frontier", "GMV", "Tangency Portfolio", "CAL"),
+       col=c("green", "red", "black", "blue"), pch=c(16, 17, 16, NA), lty=c(NA, NA, NA, 1), bty="n") # Add legend
+```
+
+# Step 7: Visualizing Data
+Displaying matrices, weights, and statistics.
+```{r}
+
+## VISUALIZING DATA ##
+
+# Display Data Frames
+cat ("\n")
+pTab
+rTab
+erTab
+
+# Display Data
+cat ("\n")
+print("Variance-Covariance Matrix:")
+cat ("\n")
+VCV
+cat ("\n")
+cat ("Mean & Excess Return Matrix:")
+cat ("\n")
+cat ("\n")
+rermat
+cat ("\n")
+cat ("Average Monthly Risk Free Rate: ",rtnx_mean)
+cat ("\n")
+cat ("\n")
+
+# Display optimal weights
+cat ("\n")
+cat ("Optimal Portfolio Weights (Short Sale Allowed):")
+cat ("\n")
+cat ("\n")
+WOPT
+cat ("\n")
+cat ("Optimal Portfolio Weights (No Short Sale):")
+cat ("\n")
+cat ("\n")
+WOPT_ns
+cat ("\n")
+cat ("Global Minimum Variance Weights:")
+cat ("\n")
+cat ("\n")
+WGMV
+cat ("\n")
+
+# Display portfolio statistic tables
+print(PTBL_opt_combined)
+print(PTBL_ns_combined)
+print(PTBL_gmv_combined)
+```
+
+# Step 8: Displaying Graphs
+Show bar chart of weights and plot of $100 allocated to portfolio index compared to market index.
+```{r}
+
+# GRAPHS #
+
+# Convert WOPT to a data frame for ggplot2
+weights0_df <- as.data.frame(WOPT)
+weights0_df$Symbols <- rownames(weights0_df)
+
+# Plotting the bar chart with labels
+ggplot(weights0_df, aes(x = Symbols, y = Weights)) +
+    geom_bar(stat = "identity", fill = "skyblue") +
+    geom_text(aes(label = round(Weights, 3)), vjust = -0.5, size = 3.5) +  # Add weight labels above bars
+    theme_minimal() +
+    labs(title = "Optimal Portfolio Weights (Short Sale Allowed)", x = "Assets", y = "Weights") +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Convert WOPT_ns to a data frame for ggplot2
+weights_df <- as.data.frame(WOPT_ns)
+weights_df$Symbols <- rownames(weights_df)
+
+# Plotting the bar chart with labels
+ggplot(weights_df, aes(x = Symbols, y = Weights)) +
+    geom_bar(stat = "identity", fill = "skyblue") +
+    geom_text(aes(label = round(Weights, 3)), vjust = -0.5, size = 3.5) +  # Add weight labels above bars
+    theme_minimal() +
+    labs(title = "Optimal Portfolio Weights (No Short Sale)", x = "Assets", y = "Weights") +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+
+# Create monthly dates from 2019-02-01 to 2023-12-01
+date_sequence <- seq(from = as.Date("2019-02-01"), to = as.Date("2023-12-01"), by = "month")
+
+# Retrieve S&P 500 data
+getSymbols("^GSPC", src = "yahoo", from = "2019-01-01", to = "2023-12-31", periodicity = "monthly") # import SP500 data
+rsp500 <- na.omit(diff(log(GSPC$GSPC.Adjusted))) # returns using difference of logs and omitting na values 
+
+# Calculate monthly index for S&P 500, remove the first value, and set initial value to $100
+sp500_index <- cumprod(1 + rsp500) * 100  # Cumulative product of (1 + return) and scaling to start at 100
+
+# Calculate the weighted returns of the portfolio for each period
+portfolio_returns <- rowSums(rMat * as.numeric(WOPT))  # Element-wise multiplication of returns and weights, summed for each row
+
+# Create a portfolio index starting at 100
+portfolio_index <- cumprod(1 + portfolio_returns) * 100  # Cumulative product of (1 + return) and scaling to start at 100
+
+# Construct the data frame with date sequence, portfolio index, and S&P 500 index
+data <- data.frame(Date = date_sequence, PortfolioIndex = portfolio_index, SP500 = sp500_index)
+
+plot(date_sequence, portfolio_index, type = "l", col = "blue", lwd = 2, xlab = "Date", ylab = "Index Value", main = "Portfolio Index v. S&P 500")
+lines(date_sequence, sp500_index, col = "red", lwd = 2)
+
+# Add a legend to differentiate between the portfolio index and S&P 500
+legend("topright", legend = c("Portfolio Index", "S&P 500"), 
+       col = c("blue", "red"), lwd = 2)
+```
+
+# Step 9: Hypothesis Testing
+F test for variance of returns
+```{r}
+var.test(x = portfolio_returns, y = rsp500)
+```
+T test for returns (unequal variances)
+```{r}
+t.test(x = portfolio_returns, y = rsp500, var.equal = FALSE)
+```
+The differences in mean returns is not statistically different than 0. Fail to reject null hypothesis that the mean returns are equal.
+
+# Step 10: Security Market Line
+```{r}
+Port_ret_pre = portfolio_returns - rtnx
+Market_ret_pre = rsp500 - rtnx
+Rf <- tnx[-1]
+
+sml <- data.frame(Date = date_sequence,Port_ret_pre,Market_ret_pre, Rf)
+sml <- sml[-1, ]
+colnames(sml) <- c("Date", "Portfolio Return Premium", "Market Return Premium", "Risk Free Rate")
+
+
+head(sml)
+```
+# Step 11: Regression Analysis
+```{r}
+reg <- summary(lm(data=sml, Port_ret_pre~Market_ret_pre))
+port_beta <- reg$coefficients[2]
+reg
+```
+The beta for the portfolio is 1.39. It is statistically significant. However, the alpha (Intercept) coefficient was not statistically significant, meaning the returns are explained by the market (no "abnormal" returns).
+
+Graphing SML
+```{r}
+library(ggplot2)
+
+# Calculate averages, set beta sequence
+MRP <- sml$`Market Return Premium`
+PRP <- sml$`Portfolio Return Premium`
+avg_mkt_pre <- mean(MRP)
+avg_port_pre <- mean(PRP)
+avg_rf <- mean(rtnx)
+sml_beta <- seq(0,2,length.out=nrow(sml))
+expected_return <- (sml_beta*avg_mkt_pre)+avg_rf
+
+# Create a data frame for plotting
+plot_data <- data.frame(Beta = sml_beta, Expected_Return = expected_return)
+
+# Plot using ggplot2
+ggplot(plot_data, aes(x = Beta, y = Expected_Return)) +
+  geom_line(color = "blue") +  # Line graph
+  geom_point(aes(x=port_beta,y=mean(portfolio_returns)),color="#2563EB",size=3)+
+   annotate(x=port_beta+0.1,y=mean(portfolio_returns),'text',label='Portfolio',fontface = "bold")+
+   annotate(x=max(sml_beta)-0.5,y=max(expected_return)-0.001,
+            'text',label='Security Market Line',fontface = "bold")+
+  labs(title = "Expected Return vs. Beta",
+       x = "Beta",
+       y = "Expected Return") +
+  theme_minimal()
+  scale_y_continuous(labels = scales::percent)
+```
+A graph of SML shows Beta on X-axis and expected return on Y.
+According to the SML plot, the portfolio has delivered higher return that it should have on its given beta.
+
+CAPM Regression
+```{r}
+# Load ggplot2 library
+library(ggplot2)
+
+# Create a data frame for plotting
+plot_data2 <- data.frame(Market_Return_Premium = sml$`Market Return Premium`, 
+                        Portfolio_Return_Premium = sml$`Portfolio Return Premium`)
+
+# Plot using ggplot2
+ggplot(plot_data2, aes(x = Market_Return_Premium, y = Portfolio_Return_Premium)) +
+  geom_point(color = "blue") +  # Scatter plot
+    geom_smooth(method = "lm", se = FALSE,color='grey50', size = 1) +  # Regression line (CAPM line)
+  labs(title = "Portfolio Return Premium vs. Market Return Premium",
+       x = "Market Return Premium",
+       y = "Portfolio Return Premium") +
+   annotate(x = max(plot_data2$Market_Return_Premium) - 0.01, 
+           y = max(plot_data2$Portfolio_Return_Premium) - 0.32, # visual adjustments to equation location
+           'text', 
+           label = paste('y =', round(reg$coefficients[1], 3), '+', round(reg$coefficients[2], 3), 'X'),
+           fontface = "bold", 
+           color = 'black') +
+  theme_minimal()
+```
+
+Graphing Dummy Regression (COVID analysis)
+```{r}
+# Load necessary library
+library(ggplot2)
+
+# Create the dataframe
+j_alpha <- portfolio_returns - port_beta * Market_ret_pre  # Use portfolio_returns
+j_alpha_df <- data.frame(Date = date_sequence, Alpha = j_alpha)
+colnames(j_alpha_df) <- c("Date", "Alpha")
+
+# Create the plot
+ggplot(j_alpha_df, aes(x = Date, y = Alpha)) +
+  geom_point(color = "red") +  # Points for individual data points
+  annotate(geom = 'text', 
+           x = as.Date('2020-05-01'), 
+           y = j_alpha_df[j_alpha_df$Date == '2020-05-01', "Alpha"] + 0.008,  # Adjust text position
+           label = 'COVID', 
+           color = 'black', 
+           size = 4.5) +
+  annotate(geom = 'text', 
+           x = as.Date('2020-09-01'), 
+           y = j_alpha_df[j_alpha_df$Date == '2020-09-01', "Alpha"] - 0.004,  # Adjust text position
+           label = 'Re-open', 
+           color = 'black', 
+           size = 4.5) +
+  labs(title = "Alpha Over Time with COVID Annotations",
+       x = "Date", 
+       y = "Alpha") +
+  theme_minimal() +
+  scale_y_continuous(limits = c(-0.10, 0.10),  # Set y-axis from -10% to +10%
+                     labels = scales::percent)  # Display y-axis labels as percentages
+```
+
+COVID Regression Calculation
+```{r}
+# Set up dummy variable
+sml$Dummy <- as.integer(sml$Date >= as.Date("2020-03-01") & sml$Date <= as.Date("2020-08-01"))
+head(sml)
+Dummy <- sml$Dummy
+
+# Run regression
+summary(lm(PRP~MRP*Dummy,data=sml))
+```
+Observation 1: P-value of F-statistic (0.0002942) < 0.05, therefore regression results are significant
+Observation 2: at 95% confidence interval, MRP increased from 1.39 to 1.43, implying market participants  demanded a higher premium during COVID period. The intercept and other variables were not significant.
+
+# Step 12: Value at Risk (VaR)
+
+Calculate Portfolio VaR
+```{r}
+
+library(ggplot2)
+
+# Calculate the 5% quantile (VaR threshold)
+var_threshold <- quantile(portfolio_returns, 0.05)
+
+# Create the plot using ggplot()
+var_port <- ggplot(data.frame(portfolio_returns), aes(x = portfolio_returns)) +
+  geom_histogram(fill = '#2563EB', bins = 30, color = 'black') +
+  geom_histogram(data = data.frame(portfolio_returns = portfolio_returns[portfolio_returns < var_threshold]),
+                 aes(x = portfolio_returns), fill = 'red', bins = 30, color = 'black') +
+  theme_minimal() +
+  labs(x = 'Monthly Return', y = 'Frequency', title = 'Portfolio VaR (5%)') +
+  scale_x_continuous(labels = scales::percent)
+
+# Display the plot
+var_port
+
+```
+
+Calculate S&P500 VaR
+```{r}
+# Calculate the 5% quantile (VaR threshold)
+var_threshold_gspc <- quantile(rsp500, 0.05)
+
+# Create the plot
+var_gspc <- ggplot(data.frame(rsp500), aes(x = rsp500)) +
+  geom_histogram(bins = 30, fill = 'grey20', color = 'black') +
+  geom_vline(xintercept = var_threshold_gspc, color = 'red', linetype = "dashed", size = 1) +
+  theme_minimal() +
+  labs(x = 'Monthly Return', y = 'Frequency', title = 'S&P 500 VaR (5%)') +
+  scale_x_continuous(labels = scales::percent)
+
+# Display the plot
+var_gspc
+```
+
+Calculate VaR
+```{r}
+library(tidyr)
+# Create a function to calculate VaR
+calculateVaR <- function(returns, alpha, time_horizon) {
+  mu <- mean(returns)
+  sigma <- sd(returns)
+  modified_mu <- mu * time_horizon
+  modified_sigma <- sigma * sqrt(time_horizon)
+  VaR <- qnorm(alpha, mean = modified_mu, sd = modified_sigma)
+  return(VaR)
+}
+
+# Define the alpha and time horizons
+alpha <- 0.05
+time_horizons <- c(1, 6, 12)  # Time horizons in months
+
+# Calculate VaR for the portfolio
+portfolio_VaR <- sapply(time_horizons, function(th) {
+  calculateVaR(portfolio_returns, alpha, th)
+})
+
+# Calculate VaR for the market
+market_VaR <- sapply(time_horizons, function(th) {
+  calculateVaR(rsp500, alpha, th)
+})
+
+# Assemble in data frame
+var_df <- data.frame(Time_Horizon = paste(time_horizons*30,'VaR'), 
+           Portfolio_VaR = abs(portfolio_VaR),
+           Market_VaR = abs(market_VaR))
+
+var_df_long <- gather(var_df, Category, VaR, -Time_Horizon)
+var_df_long
+```
+
+Graphing Portfolio v. Market VaR
+```{r}
+# Set order levels
+order_levels <- c("30 VaR", "180 VaR", "360 VaR")
+
+# Plot
+ggplot(var_df_long, aes(x = factor(Time_Horizon, levels = order_levels), 
+                        y = VaR, fill = Category)) +
+  geom_bar(stat = "identity", position = "dodge",width = 0.6,color='black') +
+  labs(
+    title = "VaR (Portfolio vs Market)",
+    x = "Time Horizon (Months)",
+    y = "VaR"
+  ) +
+  scale_y_continuous(labels = scales::percent) +
+  theme_minimal() +
+  scale_fill_manual(values = c("Market_VaR" = "grey20", "Portfolio_VaR" = '#2563EB'),
+                     labels = c("Market", "Portfolio"))+
+  theme(legend.position = "top")+
+  labs(fill = "Asset")
+```
+
+
+
+
+
+
+# Step 13: Forecasting
+
+Naive, simple, exponential smoothing and Holt-Winter Forecasting
+```{r}
+ts_port <- ts(portfolio_index,start=c(2020,1),frequency = 12)
+ts_port_train <- window(ts_port,start=2020,end=c(2024,6))
+ts_port_test <- window(ts_port,start=c(2024,7))
+
+library(forecast)
+
+fit_naive <- naive(ts_port_train,h=5)
+fit_ses <- ses(ts_port_train,h=5) 
+fit_hwa <- hw(ts_port_train,seasonal = 'additive',h=5)
+fit_hwm <- hw(ts_port_train,seasonal = 'multiplicative',h=5)
+
+naive <- autoplot(ts_port,color='grey40',size=1)+
+  autolayer(fit_naive,PI=TRUE,series = 'Naive Forecast',size=1.2)+
+  autolayer(ts_port_test,series=NA,color='black',linetype='longdash')+
+  labs(x='Date', y='Index',title='Actual vs Naive Forecast')+
+  theme_bw()+
+  scale_colour_manual(name='Method',values=c('#2563EB'))+
+  theme(legend.position=c(0.001, 0.98),
+        legend.justification=c('left', 'top'))
+
+ses <- autoplot(ts_port,color='grey40',size=1)+
+  autolayer(fit_ses,PI=TRUE,series = 'Simple Exponential Smoothing',size=1.2)+
+  autolayer(ts_port_test,series=NA,color='black',linetype='longdash')+
+  labs(x='Date', y='Index',title='Actual vs Simple Exponential Smoothing')+
+  theme_bw()+
+  scale_colour_manual(name='Method',values=c('orangered'))+
+  theme(legend.position=c(0.001, 0.98),
+        legend.justification=c('left', 'top'))
+
+hwa <- autoplot(ts_port,color='grey40',size=1)+
+  autolayer(fit_hwa,PI=TRUE,series = 'Holt-Winter Additive',size=1.2)+
+  autolayer(ts_port_test,series=NA,color='black',linetype='longdash')+
+  labs(x='Date', y='Index',title='Actual vs Holt-Winter Additive')+
+  theme_bw()+
+  scale_colour_manual(name='Method',values=c('red'))+
+  theme(legend.position=c(0.001, 0.98),
+        legend.justification=c('left', 'top'))
+
+hwm <- autoplot(ts_port,color='grey40',size=1)+
+  autolayer(fit_hwm,PI=TRUE,series = 'Holt-Winter Multiplicative',size=1.2)+
+  autolayer(ts_port_test,series=NA,color='black',linetype='longdash')+
+  labs(x='Date', y='Index',title='Actual vs Holt-Winter Multiplicative')+
+  theme_bw()+
+  scale_colour_manual(name='Method',values=c('purple'))+
+  theme(legend.position=c(0.001, 0.98),
+        legend.justification=c('left', 'top'))
+
+grid.arrange(naive,ses,hwa,hwm,ncol=2)
+```
+
+Check accuracy:
+```{r}
+accuracy_df <- rbind(accuracy(fit_naive,ts_port) %>% data.frame(),
+accuracy(fit_ses,ts_port) %>% data.frame(),
+accuracy(fit_hwa,ts_port) %>% data.frame(),
+accuracy(fit_hwm,ts_port) %>% data.frame())
+
+rownames(accuracy_df) <- c('Naive train',
+                     'Naive test',
+                     'Ses train',
+                     'Ses test',
+                     'Hwa train',
+                     'Hwa test',
+                     'Hwm train',
+                     'Hwm test')
+```
+
+Show in-sample accuracy (january 2020 - june 2024):
+```{r}
+library(knitr)
+kable(accuracy_df[seq(1,nrow(accuracy_df),by=2),])
+```
+
+Show out of sample accuracy (july 2024 - november 2024):
+```{r}
+kable(accuracy_df[seq(2, nrow(accuracy_df), by = 2), ])
+```
+
+
